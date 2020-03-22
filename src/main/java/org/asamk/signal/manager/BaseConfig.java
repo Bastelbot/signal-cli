@@ -49,6 +49,9 @@ public class BaseConfig {
             zkGroupServerPublicParams
     );
 
+    static final String KEY_BACKUP_ENCLAVE_NAME = "fe7c1bfae98f9b073d220366ea31163ee82f6d04bead774f71ca8e5c40847bfe";
+    static final String KEY_BACKUP_MRENCLAVE = "a3baab19ef6ce6f34ab9ebb25ba722725ae44a8872dc0ff08ad6d83a9489de87";
+
     private BaseConfig() {
     }
 }

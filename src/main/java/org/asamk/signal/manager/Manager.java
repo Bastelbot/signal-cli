@@ -29,6 +29,7 @@ import org.asamk.signal.storage.groups.JsonGroupStore;
 import org.asamk.signal.storage.protocol.JsonIdentityKeyStore;
 import org.asamk.signal.storage.threads.ThreadInfo;
 import org.asamk.signal.util.IOUtils;
+import org.asamk.signal.util.PinHashing;
 import org.asamk.signal.util.Util;
 import org.signal.libsignal.metadata.InvalidMetadataMessageException;
 import org.signal.libsignal.metadata.InvalidMetadataVersionException;
@@ -59,6 +60,10 @@ import org.whispersystems.libsignal.util.KeyHelper;
 import org.whispersystems.libsignal.util.Medium;
 import org.whispersystems.libsignal.util.Pair;
 import org.whispersystems.libsignal.util.guava.Optional;
+import org.whispersystems.signalservice.api.KeyBackupService;
+import org.whispersystems.signalservice.api.KeyBackupServicePinException;
+import org.whispersystems.signalservice.api.KeyBackupSystemNoDataException;
+import org.whispersystems.signalservice.api.RegistrationLockData;
 import org.whispersystems.signalservice.api.SignalServiceAccountManager;
 import org.whispersystems.signalservice.api.SignalServiceMessagePipe;
 import org.whispersystems.signalservice.api.SignalServiceMessageReceiver;
@@ -69,6 +74,8 @@ import org.whispersystems.signalservice.api.crypto.SignalServiceCipher;
 import org.whispersystems.signalservice.api.crypto.UnidentifiedAccess;
 import org.whispersystems.signalservice.api.crypto.UnidentifiedAccessPair;
 import org.whispersystems.signalservice.api.crypto.UntrustedIdentityException;
+import org.whispersystems.signalservice.api.kbs.HashedPin;
+import org.whispersystems.signalservice.api.kbs.MasterKey;
 import org.whispersystems.signalservice.api.messages.SendMessageResult;
 import org.whispersystems.signalservice.api.messages.SignalServiceAttachment;
 import org.whispersystems.signalservice.api.messages.SignalServiceAttachmentPointer;
@@ -93,6 +100,7 @@ import org.whispersystems.signalservice.api.messages.multidevice.VerifiedMessage
 import org.whispersystems.signalservice.api.profiles.SignalServiceProfile;
 import org.whispersystems.signalservice.api.push.ContactTokenDetails;
 import org.whispersystems.signalservice.api.push.SignalServiceAddress;
+import org.whispersystems.signalservice.api.push.TrustStore;
 import org.whispersystems.signalservice.api.push.exceptions.AuthorizationFailedException;
 import org.whispersystems.signalservice.api.push.exceptions.EncapsulatedExceptions;
 import org.whispersystems.signalservice.api.push.exceptions.NetworkFailureException;
@@ -101,6 +109,9 @@ import org.whispersystems.signalservice.api.util.InvalidNumberException;
 import org.whispersystems.signalservice.api.util.SleepTimer;
 import org.whispersystems.signalservice.api.util.StreamDetails;
 import org.whispersystems.signalservice.api.util.UptimeSleepTimer;
+import org.whispersystems.signalservice.internal.contacts.crypto.UnauthenticatedResponseException;
+import org.whispersystems.signalservice.internal.contacts.entities.TokenResponse;
+import org.whispersystems.signalservice.internal.push.LockedException;
 import org.whispersystems.signalservice.internal.push.SignalServiceProtos;
 import org.whispersystems.signalservice.internal.push.UnsupportedDataMessageException;
 import org.whispersystems.util.Base64;
@@ -116,6 +127,11 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.security.cert.CertificateException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -408,11 +424,67 @@ public class Manager implements Signal {
         }
     }
 
+    private RegistrationLockData restoreMasterKey(String pin,
+                                                  String basicStorageCredentials,
+                                                  TokenResponse tokenResponse)
+            throws IOException, KeyBackupSystemNoDataException, KeyBackupServicePinException {
+        if (pin == null) return null;
+
+        if (basicStorageCredentials == null) {
+            throw new AssertionError("Cannot restore KBS key, no storage credentials supplied");
+        }
+
+        KeyBackupService keyBackupService = getKeyBackupService();
+
+        KeyBackupService.RestoreSession session = keyBackupService.newRegistrationSession(basicStorageCredentials, tokenResponse);
+
+        try {
+            HashedPin hashedPin = PinHashing.hashPin(pin, session);
+            RegistrationLockData kbsData = session.restorePin(hashedPin);
+            if (kbsData == null) {
+                throw new AssertionError("Null not expected");
+            }
+            return kbsData;
+        } catch (UnauthenticatedResponseException e) {
+            throw new IOException(e);
+        }
+    }
+
     public void verifyAccount(String verificationCode, String pin) throws IOException {
         verificationCode = verificationCode.replace("-", "");
         account.setSignalingKey(KeyUtils.createSignalingKey());
         // TODO make unrestricted unidentified access configurable
-        accountManager.verifyAccountWithCode(verificationCode, account.getSignalingKey(), account.getSignalProtocolStore().getLocalRegistrationId(), true, pin, null, getSelfUnidentifiedAccessKey(), false, capabilities);
+
+        try {
+            accountManager.verifyAccountWithCode(verificationCode, account.getSignalingKey(), account.getSignalProtocolStore().getLocalRegistrationId(), true, pin, null, getSelfUnidentifiedAccessKey(), false, capabilities);
+        } catch (LockedException e) {
+            if (pin != null) {
+                String basicStorageCredentials = e.getBasicStorageCredentials();
+                if (basicStorageCredentials != null) {
+                    TokenResponse tokenResponse = getKeyBackupService().getToken(basicStorageCredentials);
+                    if (tokenResponse == null || tokenResponse.getTries() == 0) {
+                        throw new IOException("KBS Account locked");
+                    }
+
+                    RegistrationLockData registrationLockData;
+                    try {
+                        registrationLockData = restoreMasterKey(pin, basicStorageCredentials, tokenResponse);
+                    } catch (KeyBackupSystemNoDataException | KeyBackupServicePinException ex) {
+                        throw new AssertionError(ex);
+                    }
+                    if (registrationLockData == null) {
+                        throw new AssertionError("Failed to restore master key");
+                    }
+                    String registrationLock = registrationLockData.getMasterKey().deriveRegistrationLock();
+                    try {
+                        accountManager.verifyAccountWithCode(verificationCode, account.getSignalingKey(), account.getSignalProtocolStore().getLocalRegistrationId(), true, pin, registrationLock, getSelfUnidentifiedAccessKey(), false, capabilities);
+                    } catch (LockedException _e) {
+                        throw new AssertionError("KBS Pin appeared to matched but reg lock still failed!");
+                    }
+                }
+            }
+            throw new IOException("PIN locked");
+        }
 
         //accountManager.setGcmId(Optional.of(GoogleCloudMessaging.getInstance(this).register(REGISTRATION_ID)));
         account.setRegistered(true);
@@ -422,10 +494,39 @@ public class Manager implements Signal {
         account.save();
     }
 
-    public void setRegistrationLockPin(Optional<String> pin) throws IOException {
+    private KeyBackupService getKeyBackupService() {
+        TrustStore contactTrustStore = new IasTrustStore();
+        KeyStore keyStore;
+        try {
+            keyStore = KeyStore.getInstance("BKS");
+            keyStore.load(contactTrustStore.getKeyStoreInputStream(), contactTrustStore.getKeyStorePassword().toCharArray());
+        } catch (KeyStoreException | IOException | NoSuchAlgorithmException | CertificateException e) {
+            throw new AssertionError(e);
+        }
+
+        return getSignalServiceAccountManager().getKeyBackupService(keyStore,
+                BaseConfig.KEY_BACKUP_ENCLAVE_NAME,
+                BaseConfig.KEY_BACKUP_MRENCLAVE,
+                10);
+    }
+
+    private MasterKey getOrCreateMasterKey() {
+        byte[] blob = null;
+
+        if (blob == null) {
+            blob = MasterKey.createNew(new SecureRandom()).serialize();
+        }
+
+        return new MasterKey(blob);
+    }
+
+    public void setRegistrationLockPin(Optional<String> pin) throws IOException, UnauthenticatedResponseException {
         if (pin.isPresent()) {
-            account.setRegistrationLockPin(pin.get());
-            throw new RuntimeException("Not implemented anymore, will be replaced with KBS");
+            final MasterKey masterKey = getOrCreateMasterKey();
+            final KeyBackupService keyBackupService = getKeyBackupService();
+            final KeyBackupService.PinChangeSession pinChangeSession = keyBackupService.newPinChangeSession();
+            final HashedPin hashedPin = PinHashing.hashPin(pin.get(), pinChangeSession);
+            final RegistrationLockData kbsData = pinChangeSession.setPin(hashedPin, masterKey);
         } else {
             account.setRegistrationLockPin(null);
             accountManager.removeV1Pin();
